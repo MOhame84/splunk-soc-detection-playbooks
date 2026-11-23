@@ -1,0 +1,41 @@
+# ==============================================================================
+# Splunk SPL Detection Playbook — Web Attacks & Authentication Anomalies
+# Author: Mohamed Elsayed Mohamed
+# ==============================================================================
+
+# 1. Failed-login volume with a success in the same search period
+# Data Source: Windows Security Event Logs (4625 -> 4624); map fields to your sourcetype.
+# Note: This identifies co-occurrence, not guaranteed sequence. Review the timeline below.
+index=security (EventCode=4625 OR EventCode=4624)
+| stats count(eval(EventCode=4625)) as failed_attempts
+        count(eval(EventCode=4624)) as successful_logins
+        values(Account_Name) as targeted_accounts
+        earliest(_time) as first_seen latest(_time) as last_seen by src_ip
+| where failed_attempts >= 10 AND successful_logins >= 1
+| eval duration_sec = last_seen - first_seen
+| table src_ip, targeted_accounts, failed_attempts, successful_logins, duration_sec
+| sort - failed_attempts
+# False Positives: Misconfigured service accounts or automated vulnerability scanners with valid test creds.
+# Next Step: Check session activity post-login (process creation, privilege changes, source geolocation).
+
+# 2. Web attack indicators with HTTP 200 (investigation lead, not proof of exploitation)
+# Data Source: Apache / Nginx access_combined logs
+# Logic: Surface attack-like URIs that returned 200 for analyst review.
+index=web sourcetype=access_combined status=200
+| where match(uri, "(?i)(\.\./|%2e%2e|%252e|169\.254\.169\.254|union\s+select|<script)")
+| stats count values(uri) as matched_uris values(user_agent) as user_agents by clientip, host
+| sort - count
+# False Positives: Legitimate application parameters containing words like "union" or "select" in search text.
+# Next Step: Inspect full HTTP response size and pivot to EDR/process logs on the target web host.
+
+# 3. Directory Enumeration / Automated Recon Burst Detection
+# Data Source: Web server access logs
+# Logic: Detect concentrated HTTP 404 responses from one IP in a five-minute bucket.
+index=web sourcetype=access_combined status=404
+| bucket _time span=5m
+| stats count as not_found_count dc(uri) as unique_paths values(user_agent) as ua by _time, clientip
+| where not_found_count >= 25 AND unique_paths >= 20
+| sort - not_found_count
+# False Positives: Broken frontend asset links after a new web deployment (check if multiple normal users hit the same 404 URI).
+# Next Step: Check if the same clientip subsequently generated HTTP 200 requests on sensitive paths (/admin, /.env, /api).
+
